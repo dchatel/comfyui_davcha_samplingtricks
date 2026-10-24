@@ -103,6 +103,60 @@ class DavchaMaskedNoise(io.ComfyNode):
         blended_noise = MaskedNoise(base_noise, masked_noise, mask, normalize, linear_blend)
         return io.NodeOutput(blended_noise)
 
+class DavchaLatentNoise(io.ComfyNode):
+    """
+    Converts an encoded image latent (or raw image) into a Noise object.
+    Perfect for injecting structured data into a Masked Noise Blend for seamless inpainting.
+    Requires the input to perfectly match the generation dimensions.
+    """
+    
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="DavchaLatentNoise",
+            display_name="Latent Noise Generator",
+            category="davcha/noise",
+            inputs=[
+                io.MultiType.Input("canvas", types=[io.Latent, io.Image], tooltip="Provide either an encoded LATENT or a pixel IMAGE."),
+                io.Combo.Input("mode", default="full", options=["full", "phase", "magnitude"], tooltip="Full: Standard Image. Phase: 'Ghost' structure mask. Magnitude: Custom frequency texture."),
+                io.Boolean.Input("normalize", default=True, tooltip="Normalize the output noise to have a standard deviation of 1.0. This is recommended for most use cases."),
+                io.Vae.Input("vae", optional=True, tooltip="Required ONLY if providing an IMAGE."),
+            ],
+            outputs=[
+                io.Noise.Output(),
+            ]
+        )
+
+    @classmethod
+    def execute(cls, canvas, mode="full", normalize=True, vae=None) -> io.NodeOutput:
+        # 1. Determine if we received an IMAGE (tensor) or LATENT (dict)
+        if isinstance(canvas, dict) and "samples" in canvas:
+            latent = canvas
+            
+        elif isinstance(canvas, torch.Tensor):
+            # It's an IMAGE, so we must encode it on the fly.
+            if vae is None:
+                raise ValueError(
+                    "\n[Davcha Latent Noise] Missing VAE!\n"
+                    "You provided an IMAGE, but no VAE was connected. "
+                    "Please connect a VAE to encode the image into latent space."
+                )
+            
+            # Standard ComfyUI VAE Encode: Expects [B, H, W, C], drops alpha channel if present
+            pixels = canvas[:, :, :, :3]
+            encoded_tensor = vae.encode(pixels)
+            
+            # Wrap it in the standard ComfyUI latent dictionary format
+            latent = {"samples": encoded_tensor}
+            
+        else:
+            raise TypeError(f"[Davcha Latent Noise] Unsupported input type. Expected LATENT dict or IMAGE tensor, got {type(canvas)}")
+            
+        # 2. Pass to the noise generator object (now including mode)
+        latent_noise = LatentNoise(latent, normalize=normalize, mode=mode)
+        
+        return io.NodeOutput(latent_noise)
+    
 # ------------------------------------------------------------
 # Sampling nodes
 # ------------------------------------------------------------
@@ -129,55 +183,25 @@ class DavchaScheduledSampler(io.ComfyNode):
         
         return io.NodeOutput(KSAMPLER(sampler_function, extra_options={'samplers': samplers, 'splits': splits_list}))
 
-class DavchaLatentNoise(io.ComfyNode):
-    """
-    Converts an encoded image latent (or raw image) into a Noise object.
-    Perfect for injecting structured data into a Masked Noise Blend for seamless inpainting.
-    Requires the input to perfectly match the generation dimensions.
-    """
-    
+class DavchaEnsureDecreasingSigmas(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="DavchaLatentNoise",
-            display_name="Latent Noise Generator",
-            category="davcha/noise",
+            node_id="DavchaEnsureDecreasingSigmas",
+            category="sampling/custom_sampling/samplers",
             inputs=[
-                io.MultiType.Input("canvas", types=[io.Latent, io.Image], tooltip="Provide either an encoded LATENT or a pixel IMAGE."),
-                io.Boolean.Input("normalize", default=True, tooltip="Normalize the output noise to have a standard deviation of 1.0. This is recommended for most use cases."),
-                io.Vae.Input("vae", optional=True, tooltip="Required ONLY if providing an IMAGE."),
+                io.Sigmas.Input("sigmas"),
             ],
             outputs=[
-                io.Noise.Output(),
+                io.Sigmas.Output(),
             ]
         )
-
+   
     @classmethod
-    def execute(cls, canvas, normalize=True, vae=None) -> io.NodeOutput:
-        # 1. Determine if we received an IMAGE (tensor) or LATENT (dict)
-        if isinstance(canvas, dict) and "samples" in canvas:
-            latent = canvas
-            
-        elif isinstance(canvas, torch.Tensor):
-            # It's an IMAGE, so we must encode it on the fly.
-            if vae is None:
-                raise ValueError(
-                    "\n[Davcha Latent Noise] Missing VAE!\n"
-                    "You provided an IMAGE, but no VAE was connected. "
-                    "Please connect a VAE to encode the image into latent space."
-                )
-            
-            # Standard ComfyUI VAE Encode: Expects [B, H, W, C], drops alpha channel if present
-            pixels = canvas[:, :, :, :3]
-            encoded_tensor = vae.encode(pixels)
-            
-            # Wrap it in the standard ComfyUI latent dictionary format
-            latent = {"samples": encoded_tensor}
-            
-        else:
-            raise TypeError(f"[Davcha Latent Noise] Unsupported input type. Expected LATENT dict or IMAGE tensor, got {type(canvas)}")
-            
-        # 2. Pass to the noise generator object
-        latent_noise = LatentNoise(latent, normalize=normalize)
-        
-        return io.NodeOutput(latent_noise)
+    def execute(cls, sigmas) -> io.NodeOutput:
+        # Ensure that the sigmas are strictly decreasing
+        x = torch.clone(sigmas)
+        d = abs(x[1:] - x[:-1])
+        x[-1] = 0.0
+        x[:-1] = reversed(reversed(d).cumsum(dim=0))
+        return io.NodeOutput(x)

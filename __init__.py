@@ -9,6 +9,7 @@ class DavchaSamplingTricksExtension(ComfyExtension):
             DavchaScheduledSampler,
             DavchaMaskedNoise,
             DavchaLatentNoise,
+            DavchaEnsureDecreasingSigmas,
         ]
         
 async def comfy_entrypoint() -> DavchaSamplingTricksExtension:

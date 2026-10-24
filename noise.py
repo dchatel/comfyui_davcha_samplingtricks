@@ -223,10 +223,10 @@ class MaskedNoise:
             return self._process_single_tensor(x, y, self.mask)
 
 class LatentNoise:
-    def __init__(self, latent_dict, normalize):
-        # Extract the actual tensor from the ComfyUI latent dictionary
+    def __init__(self, latent_dict, normalize=True, mode="full"):
         self.latent_tensor = latent_dict["samples"]
         self.normalize = normalize
+        self.mode = mode
         self.seed = 0
 
     def _process_single(self, target, src):
@@ -234,23 +234,50 @@ class LatentNoise:
         *_, sH, sW = src.shape
         
         # STRICT SIZE ENFORCEMENT
-        # We do not resize latents. Latent interpolation destroys VAE features 
-        # and breaks spatial alignment with masks.
         if (tH, tW) != (sH, sW):
             raise ValueError(
                 f"\n[Davcha Latent Noise] Shape Mismatch!\n"
                 f"Your injected LatentNoise is {sW*8}x{sH*8} (Latent {sW}x{sH}), "
                 f"but the generation target is {tW*8}x{tH*8} (Latent {tW}x{tH}).\n"
-                f"Fix: Please pad/crop the source image in pixel space BEFORE generating the noise so it exactly matches your generation size."
+                f"Fix: Please pad/crop the source image in pixel space BEFORE generating the noise."
             )
-        
+            
+        if self.mode == "full":
+            out = src
+        else:
+            # We need standard random noise to supply the missing half of the equation
+            # Generated on the same device and converted to float32 for FFT
+            noise = torch.randn_like(src, dtype=torch.float32)
+            src_f = src.to(torch.float32)
+            
+            # 1. Transform both to Frequency Domain
+            fft_src = torch.fft.fft2(src_f, dim=(-2, -1))
+            fft_noise = torch.fft.fft2(noise, dim=(-2, -1))
+            
+            if self.mode == "phase":
+                # Ghost Mode: Image's Phase (Structure) + Noise's Magnitude (Static)
+                mag = torch.abs(fft_noise)
+                phase = torch.angle(fft_src)
+                
+            elif self.mode == "magnitude":
+                # Texture Mode: Image's Magnitude (EQ Curve) + Noise's Phase (Scrambled Structure)
+                mag = torch.abs(fft_src)
+                phase = torch.angle(fft_noise)
+                
+            # 2. Recombine using Polar coordinates and inverse FFT back to Spatial Domain
+            fft_combined = torch.polar(mag, phase)
+            out = torch.fft.ifft2(fft_combined, dim=(-2, -1)).real
+            out = out.to(src.dtype)
+            
+        # Optional Global Normalization
         if self.normalize:
-            std = src.std()
+            std = out.std()
             if std > 0:
-                src = (src - src.mean()) / std
+                out = (out - out.mean()) / std
             else:
-                src = src - src.mean()
-        return src
+                out = out - out.mean()
+                
+        return out
 
     def generate_noise(self, input_latent):
         target = input_latent["samples"] if isinstance(input_latent, dict) else input_latent
@@ -270,7 +297,7 @@ class LatentNoise:
                 
             res = self._process_single(target, src)
             
-            # Safe Batch Expansion: If we have 1 injected image but are generating a batch of 4, duplicate it.
+            # Safe Batch Expansion
             if res.shape[0] != target.shape[0]:
                 if res.shape[0] == 1:
                     res = res.expand(target.shape[0], -1, -1, -1)
