@@ -121,8 +121,6 @@ class DavchaLatentNoise(io.ComfyNode):
                 io.Combo.Input("mode", default="full", options=["full", "phase", "magnitude"], tooltip="Full: Standard Image. Phase: 'Ghost' structure mask. Magnitude: Custom frequency texture."),
                 io.Boolean.Input("normalize", default=True, tooltip="Normalize the output noise to have a standard deviation of 1.0. This is recommended for most use cases."),
                 io.Vae.Input("vae", optional=True, tooltip="Required ONLY if providing an IMAGE."),
-                io.Int.Input("noise_seed", default=0, min=0, max=0xffffffffffffffff, control_after_generate=True, tooltip="Seed for the random half of the phase/magnitude modes, for latent components without a source, and for the sampler's own noise."),
-                io.Model.Input("model", optional=True, tooltip="Converts the latent to the model's internal latent scale. Only matters when normalize is off."),
             ],
             outputs=[
                 io.Noise.Output(),
@@ -130,11 +128,11 @@ class DavchaLatentNoise(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, canvas, mode, normalize, noise_seed, vae=None, model=None) -> io.NodeOutput:
+    def execute(cls, canvas, mode="full", normalize=True, vae=None) -> io.NodeOutput:
         # 1. Determine if we received an IMAGE (tensor) or LATENT (dict)
         if isinstance(canvas, dict) and "samples" in canvas:
-            samples = canvas["samples"]
-
+            latent = canvas
+            
         elif isinstance(canvas, torch.Tensor):
             # It's an IMAGE, so we must encode it on the fly.
             if vae is None:
@@ -145,15 +143,19 @@ class DavchaLatentNoise(io.ComfyNode):
                 )
             
             # Standard ComfyUI VAE Encode: Expects [B, H, W, C], drops alpha channel if present
-            samples = vae.encode(canvas[:, :, :, :3])
-
+            pixels = canvas[:, :, :, :3]
+            encoded_tensor = vae.encode(pixels)
+            
+            # Wrap it in the standard ComfyUI latent dictionary format
+            latent = {"samples": encoded_tensor}
+            
         else:
             raise TypeError(f"[Davcha Latent Noise] Unsupported input type. Expected LATENT dict or IMAGE tensor, got {type(canvas)}")
-
-        if model is not None:
-            samples = model.model.process_latent_in(samples)
-
-        return io.NodeOutput(LatentNoise(samples, normalize, mode, noise_seed))
+            
+        # 2. Pass to the noise generator object (now including mode)
+        latent_noise = LatentNoise(latent, normalize=normalize, mode=mode)
+        
+        return io.NodeOutput(latent_noise)
     
 # ------------------------------------------------------------
 # Sampling nodes
@@ -176,11 +178,9 @@ class DavchaScheduledSampler(io.ComfyNode):
    
     @classmethod
     def execute(cls, autogrow, splits) -> io.NodeOutput:
-        splits_list = [int(s) for s in splits.split(',') if s.strip()]
+        splits_list = [int(s.strip()) for s in splits.split(',')]
         samplers = [v for k, v in sorted(autogrow.items())]
-        if len(splits_list) != len(samplers) - 1:
-            raise ValueError(f"[Davcha Scheduled Sampler] {len(samplers)} sampler(s) need {len(samplers) - 1} split(s), got {len(splits_list)}: '{splits}'.")
-
+        
         return io.NodeOutput(KSAMPLER(sampler_function, extra_options={'samplers': samplers, 'splits': splits_list}))
 
 class DavchaEnsureDecreasingSigmas(io.ComfyNode):
@@ -188,7 +188,7 @@ class DavchaEnsureDecreasingSigmas(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="DavchaEnsureDecreasingSigmas",
-            category="sampling/custom_sampling/sigmas",
+            category="sampling/custom_sampling/samplers",
             inputs=[
                 io.Sigmas.Input("sigmas"),
             ],
@@ -196,12 +196,12 @@ class DavchaEnsureDecreasingSigmas(io.ComfyNode):
                 io.Sigmas.Output(),
             ]
         )
-
+   
     @classmethod
     def execute(cls, sigmas) -> io.NodeOutput:
-        # Rebuild a decreasing schedule from the absolute step sizes, rescaled to keep the original first and last sigma
-        x = sigmas.clone()
-        steps = (sigmas[1:] - sigmas[:-1]).abs().flip(0).cumsum(0).flip(0)
-        if len(steps) > 0 and steps[0] > 0:
-            x[:-1] = sigmas[-1] + steps * ((sigmas[0] - sigmas[-1]) / steps[0])
+        # Ensure that the sigmas are strictly decreasing
+        x = torch.clone(sigmas)
+        d = abs(x[1:] - x[:-1])
+        x[-1] = 0.0
+        x[:-1] = reversed(reversed(d).cumsum(dim=0))
         return io.NodeOutput(x)
