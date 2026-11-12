@@ -28,12 +28,12 @@ def create_radial_filter(spectrum, H, W, device):
     return torch.lerp(lower_val, upper_val, weight)
 
 class SpectralNoise:
-    def __init__(self, a, b, spectrum_tensor):
+    def __init__(self, a, b, spectrum_tensor, normalize):
         self.a = a
         self.b = b
         self.spectrum = spectrum_tensor
-        self.seed = 0
-
+        self.normalize = normalize
+        self.seed = getattr(a, "seed", 0)
 
     def _process_single_tensor(self, x, y):
         device = x.device
@@ -59,12 +59,11 @@ class SpectralNoise:
         shaped = torch.fft.ifft2(torch.fft.ifftshift(blended_fft, dim=(-2, -1)), dim=(-2, -1)).real
         
         # Normalize
-        std = shaped.std()
-        if std > 0:
-            shaped = (shaped - shaped.mean()) / std
-        else:
-            shaped = shaped - shaped.mean()
-            
+        if self.normalize:
+            std = shaped.std()
+            if std > 0:
+                shaped = (shaped - shaped.mean()) / std
+                
         # Return cleanly in the exact original dtype
         return shaped.to(dtype)
 
@@ -87,7 +86,7 @@ class SpectralNoiseEQ:
         self.base_noise = base_noise
         self.spectrum = spectrum_tensor
         self.normalize = normalize
-        self.seed = 0
+        self.seed = getattr(base_noise, "seed", 0)
 
     def _process_single_tensor(self, x):
         device = x.device
@@ -113,11 +112,10 @@ class SpectralNoiseEQ:
         # 5. Global Normalization
         # (This ensures the overall volume of the noise stays acceptable for the scheduler,
         # but the *distribution* of that volume is dictated by your EQ curve).
-        std = shaped.std()
-        if std > 0 and self.normalize:
-            shaped = (shaped - shaped.mean()) / std
-        else:
-            shaped = shaped - shaped.mean()
+        if self.normalize:
+            std = shaped.std()
+            if std > 0:
+                shaped = (shaped - shaped.mean()) / std
             
         return shaped.to(dtype)
 
@@ -190,11 +188,10 @@ class MaskedNoise:
             blended = (torch.sqrt(1.0 - m) * x_f) + (torch.sqrt(m) * y_f)
         
         # 5. Global Normalization
-        std = blended.std()
-        if std > 0 and self.normalize:
-            blended = (blended - blended.mean()) / std
-        else:
-            blended = blended - blended.mean()
+        if self.normalize:
+            std = blended.std()
+            if std > 0:
+                blended = (blended - blended.mean()) / std
             
         return blended.to(dtype)
 
@@ -274,8 +271,6 @@ class LatentNoise:
             std = out.std()
             if std > 0:
                 out = (out - out.mean()) / std
-            else:
-                out = out - out.mean()
                 
         return out
 

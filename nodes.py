@@ -24,6 +24,7 @@ class DavchaSpectralNoiseBlend(io.ComfyNode):
                 io.Noise.Input("noise_a"),
                 io.Noise.Input("noise_b"),
                 io.MultiType.Input("spectrum", types=[io.Sigmas, io.Float], tooltip="1D tensor controlling frequency blending. 0.0 = Noise B, 1.0 = Noise A"),
+                io.Boolean.Input("normalize", default=True, tooltip="Normalize the output noise to have a standard deviation of 1.0."),
             ],
             outputs=[
                 io.Noise.Output(),
@@ -31,14 +32,14 @@ class DavchaSpectralNoiseBlend(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, noise_a, noise_b, spectrum) -> io.NodeOutput:
+    def execute(cls, noise_a, noise_b, spectrum, normalize) -> io.NodeOutput:
         if isinstance(spectrum, float):
             # Convert single float to a 1D tensor for compatibility
             spectrum = torch.tensor([spectrum], dtype=torch.float32)
         elif isinstance(spectrum, list):
             # Convert list of floats to a 1D tensor for compatibility
             spectrum = torch.tensor(spectrum, dtype=torch.float32)
-        blended_noise = SpectralNoise(noise_a, noise_b, spectrum)
+        blended_noise = SpectralNoise(noise_a, noise_b, spectrum, normalize)
         return io.NodeOutput(blended_noise)
     
 class DavchaSpectralNoiseEQ(io.ComfyNode):
