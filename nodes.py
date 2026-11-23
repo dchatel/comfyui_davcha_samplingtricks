@@ -3,7 +3,7 @@ import torch
 from comfy_api.latest import io
 from comfy.samplers import KSAMPLER
 from .noise import *
-from .sampler import sampler_function
+from .sampler import sampler_function, fourier_upscale_sampler_function
 
 # ------------------------------------------------------------
 # Noise nodes
@@ -183,6 +183,69 @@ class DavchaScheduledSampler(io.ComfyNode):
         samplers = [v for k, v in sorted(autogrow.items())]
         
         return io.NodeOutput(KSAMPLER(sampler_function, extra_options={'samplers': samplers, 'splits': splits_list}))
+
+class DavchaSamplerFourierUpscale(io.ComfyNode):
+    """
+    Latent upscaler sampler with optional 2x2 patch unpacking (Flux.2 / Wan 2.2)
+    and energy-preserving Fourier noise anchoring.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="DavchaSamplerFourierUpscale",
+            display_name="Sampler Fourier Upscale",
+            category="sampling/custom_sampling/samplers",
+            inputs=[
+                io.Float.Input("scale_ratio", default=1.26, min=1.0, max=4.0, step=0.01),
+                io.Int.Input("scale_steps", default=-1, min=-1, max=100, step=1),
+                io.Combo.Input("denoised_upscale", default="bislerp", options=["bislerp", "fourier_tukey", "bicubic", "bilinear"]),
+                io.Boolean.Input("patch_unpack_2x2", default=True, tooltip="Unpack 2x2 channel-patched 16x latents (Flux.2 128ch, Wan 2.2 48ch). Disable for 8x latents (Flux.1, SDXL, Z-Image)."),
+                io.Float.Input("noise_anchor", default=1.0, min=0.0, max=1.0, step=0.05, tooltip="0.0 = fresh noise (like LCMUpscale), 1.0 = preserve exact low-freq noise."),
+                io.Float.Input("tukey_alpha", default=0.25, min=0.0, max=1.0, step=0.05, tooltip="Cosine taper width when using fourier_tukey."),
+                io.MultiType.Input("anchor_spectrum", types=[io.Sigmas, io.Float], optional=True, tooltip="Optional radial anchoring curve (0.0 to 1.0) over the original frequency band."),
+                io.Noise.Input("high_freq_noise", optional=True, tooltip="Optional Noise node (e.g. SpectralNoiseEQ) supplying the high frequencies."),
+            ],
+            outputs=[
+                io.Sampler.Output(),
+            ],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        scale_ratio,
+        scale_steps,
+        denoised_upscale,
+        patch_unpack_2x2,
+        noise_anchor,
+        tukey_alpha,
+        anchor_spectrum=None,
+        high_freq_noise=None,
+    ) -> io.NodeOutput:
+        if anchor_spectrum is None:
+            spectrum = torch.tensor([1.0], dtype=torch.float32)
+        elif isinstance(anchor_spectrum, float):
+            spectrum = torch.tensor([anchor_spectrum], dtype=torch.float32)
+        elif isinstance(anchor_spectrum, list):
+            spectrum = torch.tensor(anchor_spectrum, dtype=torch.float32)
+        else:
+            spectrum = anchor_spectrum.to(torch.float32)
+
+        sampler = KSAMPLER(
+            fourier_upscale_sampler_function,
+            extra_options={
+                "scale_ratio": scale_ratio,
+                "scale_steps": scale_steps,
+                "denoised_upscale": denoised_upscale,
+                "patch_unpack_2x2": patch_unpack_2x2,
+                "noise_anchor": noise_anchor,
+                "anchor_spectrum": spectrum,
+                "tukey_alpha": tukey_alpha,
+                "high_freq_noise": high_freq_noise,
+            },
+        )
+        return io.NodeOutput(sampler)
 
 class DavchaEnsureDecreasingSigmas(io.ComfyNode):
     @classmethod
