@@ -56,6 +56,30 @@ Allows you to chain multiple distinct samplers together during a single generati
   * Steps `11-20`: Uses Sampler 2
   * Steps `21-30`: Uses Sampler 3
 
+### 🔍 Sampler Fourier Upscale (`DavchaSamplerFourierUpscale`)
+A sampler that upscales the latent *during* sampling. At each scaling step it splits the current state into the denoised estimate and its noise, upscales the denoised estimate, and rebuilds the noise at the new size: the original noise is kept exactly in the frequency band it already covered, and fresh noise fills only the new high frequencies. The latent is then re-noised at the next sigma, so the following steps see a consistent, correctly scaled noise.
+* **Inputs:**
+  * `scale_ratio`: Total upscale ratio, reached at the last scaling step.
+  * `scale_steps`: Number of steps over which the size is ramped up to `scale_ratio` (`-1` = all steps).
+  * `denoised_upscale`: Method used for the denoised estimate (`bislerp`, `fourier_tukey`, `bicubic`, `bilinear`).
+  * `noise_anchor`: `1.0` keeps the original noise in its frequency band, `0.0` replaces it with fresh noise.
+  * `tukey_alpha`: Cosine taper width of the spectrum when using `fourier_tukey`.
+  * `anchor_spectrum` *(optional)*: Radial curve (Sigmas or Float) modulating `noise_anchor` from low to high frequencies.
+  * `high_freq_noise` *(optional)*: Noise node supplying the fresh noise. Its seed is offset by the step index; without it, noise is generated from the sampler seed.
+* **Notes:**
+  * Flow-matching and EPS models are detected from the model itself. 2x2 channel-patched latents (**Flux.2**, **Wan 2.2**) are unpacked before upscaling, so the upscale works on the real spatial grid.
+  * Video latents are upscaled frame by frame. With `NestedTensor` latents, only the first (video) latent is upscaled.
+  * Not compatible with inpainting (`denoise_mask`), since the latent no longer matches the mask size.
+
+#### Recipe: one-pass hires fix (tested on Flux.2 Klein 9B)
+Use it inside a **Scheduled Sampler**, as a single step at a repeated sigma, so it only changes resolution without denoising:
+* Sigmas: `1.0, 0.966, 0.966, 0.9331, 0.875, 0.7299, 0.358, 0.0`. Note the repeated `0.966`.
+* Scheduled Sampler with `splits` = `1, 2`:
+  * `sampler0`: `SamplerDPMPP_2M_SDE` (heun, eta `0.05`) for the first step (`1.0 → 0.966`).
+  * `sampler1`: **Sampler Fourier Upscale** (`scale_ratio` `1.26`, `scale_steps` `-1`, `bislerp`, `noise_anchor` `1.0`) for the upscale step (`0.966 → 0.966`).
+  * `sampler2`: `SamplerER_SDE` (Reverse-time SDE, max_stage `3`, eta `1.0`) for the remaining steps at the new resolution.
+* A structured noise (e.g. RES4LYF `AdvancedNoise`, fractal) plugged into `high_freq_noise` works well for the new high frequencies.
+
 ---
 
 ## 🛠️ Installation

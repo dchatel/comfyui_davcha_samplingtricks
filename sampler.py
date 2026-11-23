@@ -1,3 +1,4 @@
+import copy
 import math
 import numpy as np
 import torch
@@ -5,6 +6,8 @@ import torch.nn.functional as F
 from tqdm.auto import trange
 import comfy.utils
 import comfy.model_sampling
+import comfy.latent_formats
+from comfy.nested_tensor import NestedTensor
 
 from .noise import create_radial_filter
 
@@ -107,174 +110,112 @@ def _upscale_denoised_4d(d4d: torch.Tensor, h2: int, w2: int, method: str, patch
     return F.pixel_unshuffle(up, 2) if use_unpack else up
 
 
-def _generate_target_noise(reference_tensor: torch.Tensor, h2: int, w2: int, high_freq_noise) -> torch.Tensor:
-    target_shape = (*reference_tensor.shape[:-2], h2, w2)
-    if high_freq_noise is None:
-        return torch.randn(target_shape, device=reference_tensor.device, dtype=reference_tensor.dtype)
-    dummy = torch.empty(target_shape, device=reference_tensor.device, dtype=reference_tensor.dtype)
-    n = high_freq_noise.generate_noise({"samples": dummy})
-    return n.to(device=reference_tensor.device, dtype=reference_tensor.dtype)
+def _fourier_mix_noise_4d(eps4d, fresh4d, anchor_spectrum, noise_anchor):
+    if noise_anchor <= 0.0:
+        return fresh4d
 
-
-def _fourier_mix_noise_4d(
-    eps4d: torch.Tensor,
-    fresh4d: torch.Tensor,
-    anchor_spectrum: torch.Tensor,
-    noise_anchor: float,
-) -> torch.Tensor:
     _, _, h, w = eps4d.shape
     _, _, h2, w2 = fresh4d.shape
-    dtype = eps4d.dtype
 
-    if noise_anchor <= 0.0 or h2 < h or w2 < w:
-        return fresh4d.to(dtype)
-
-    # Réutilisation directe de ton create_radial_filter sur la bande (H, W)
-    filter_2d = create_radial_filter(anchor_spectrum, h, w, eps4d.device)
-    mask = torch.clamp(filter_2d * noise_anchor, 0.0, 1.0)
-    mask = mask.view(*([1] * (eps4d.ndim - 2)), h, w)
-
-    if h == h2 and w == w2:
-        fft_e = torch.fft.fftshift(torch.fft.fft2(eps4d.to(torch.float32), dim=(-2, -1), norm="ortho"), dim=(-2, -1))
-        fft_f = torch.fft.fftshift(torch.fft.fft2(fresh4d.to(torch.float32), dim=(-2, -1), norm="ortho"), dim=(-2, -1))
-        blended = torch.sqrt(mask) * fft_e + torch.sqrt(1.0 - mask) * fft_f
-        out = torch.fft.ifft2(torch.fft.ifftshift(blended, dim=(-2, -1)), dim=(-2, -1), norm="ortho").real
-        return out.to(dtype)
+    mask = torch.clamp(create_radial_filter(anchor_spectrum, h, w, eps4d.device) * noise_anchor, 0.0, 1.0)
 
     fft_e = torch.fft.fftshift(torch.fft.fft2(eps4d.to(torch.float32), dim=(-2, -1), norm="ortho"), dim=(-2, -1))
     fft_f = torch.fft.fftshift(torch.fft.fft2(fresh4d.to(torch.float32), dim=(-2, -1), norm="ortho"), dim=(-2, -1))
 
     h0 = h2 // 2 - h // 2
     w0 = w2 // 2 - w // 2
+    fresh_band = fft_f[..., h0:h0 + h, w0:w0 + w].clone()
+    fft_f[..., h0:h0 + h, w0:w0 + w] = torch.sqrt(mask) * fft_e + torch.sqrt(1.0 - mask) * fresh_band
 
-    fft_mix = fft_f.clone()
-    center_f = fft_f[..., h0:h0 + h, w0:w0 + w]
-    center_mix = torch.sqrt(mask) * fft_e + torch.sqrt(1.0 - mask) * center_f
-    fft_mix[..., h0:h0 + h, w0:w0 + w] = center_mix
-
-    # Symétrie hermitienne sur les bins de Nyquist (si pairs)
+    # Nyquist bins of the original band: split between both ends, keeping unit variance
+    half = math.sqrt(0.5)
     if h % 2 == 0 and h0 + h < h2:
-        nyq_h = center_mix[..., 0, :]
-        fft_mix[..., h0, w0:w0 + w] = 0.5 * nyq_h + 0.5 * fft_f[..., h0, w0:w0 + w]
-        fft_mix[..., h0 + h, w0:w0 + w] = fft_mix[..., h0, w0:w0 + w]
+        fft_f[..., h0, w0:w0 + w] = half * fft_f[..., h0, w0:w0 + w] + half * fresh_band[..., 0, :]
+        fft_f[..., h0 + h, w0:w0 + w] = fft_f[..., h0, w0:w0 + w]
     if w % 2 == 0 and w0 + w < w2:
-        nyq_w = fft_mix[..., h0:h0 + h, w0]
-        fft_mix[..., h0:h0 + h, w0] = 0.5 * nyq_w + 0.5 * fft_f[..., h0:h0 + h, w0]
-        fft_mix[..., h0:h0 + h, w0 + w] = fft_mix[..., h0:h0 + h, w0]
+        fft_f[..., h0:h0 + h, w0] = half * fft_f[..., h0:h0 + h, w0] + half * fresh_band[..., :, 0]
+        fft_f[..., h0:h0 + h, w0 + w] = fft_f[..., h0:h0 + h, w0]
 
-    out = torch.fft.ifft2(torch.fft.ifftshift(fft_mix, dim=(-2, -1)), dim=(-2, -1), norm="ortho").real
-    std = out.std(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
-    out = out / std
-    return out.to(dtype)
+    out = torch.fft.ifft2(torch.fft.ifftshift(fft_f, dim=(-2, -1)), dim=(-2, -1), norm="ortho").real
+    return out.to(eps4d.dtype)
 
 
-def _is_flow_matching(model_k, sigmas) -> bool:
-    ms = getattr(getattr(model_k, "model_patcher", None), "model", None)
-    ms = getattr(ms, "model_sampling", None)
-    if ms is None:
-        ms = getattr(getattr(model_k, "inner_model", None), "model_sampling", None)
-    if ms is not None:
-        return isinstance(ms, comfy.model_sampling.CONST)
-    return float(sigmas.max().item()) <= 1.0001
-
-
-def _upscale_step_tensors(
-    denoised_t: torch.Tensor,
-    eps_t: torch.Tensor,
-    target_scale: float,
-    denoised_upscale: str,
-    patch_unpack_2x2: bool,
-    tukey_alpha: float,
-    anchor_spectrum: torch.Tensor,
-    noise_anchor: float,
-    high_freq_noise,
-):
-    d4d, meta = _to_4d(denoised_t)
-    e4d, _ = _to_4d(eps_t)
-    _, _, h, w = d4d.shape
-
-    h2 = max(2, (int(round(h * target_scale)) // 2) * 2)
-    w2 = max(2, (int(round(w * target_scale)) // 2) * 2)
-
-    if h2 != h or w2 != w:
-        d_up = _upscale_denoised_4d(d4d, h2, w2, denoised_upscale, patch_unpack_2x2, tukey_alpha)
-        fresh4d = _generate_target_noise(e4d, h2, w2, high_freq_noise)
-        e_up = _fourier_mix_noise_4d(e4d, fresh4d, anchor_spectrum, noise_anchor)
-        return _from_4d(d_up, meta), _from_4d(e_up, meta)
-
-    if noise_anchor < 1.0 or (anchor_spectrum < 1.0).any():
-        fresh4d = _generate_target_noise(e4d, h, w, high_freq_noise)
-        e_mix = _fourier_mix_noise_4d(e4d, fresh4d, anchor_spectrum, noise_anchor)
-        return denoised_t, _from_4d(e_mix, meta)
-
-    return denoised_t, eps_t
-
-
-@torch.no_grad()
 def fourier_upscale_sampler_function(model_k, noise, sigmas, extra_args=None, callback=None, disable=None, **extra_options):
-    scale_ratio = extra_options.pop("scale_ratio", 1.26)
-    scale_steps = extra_options.pop("scale_steps", -1)
-    denoised_upscale = extra_options.pop("denoised_upscale", "bislerp")
-    patch_unpack_2x2 = extra_options.pop("patch_unpack_2x2", True)
-    noise_anchor = extra_options.pop("noise_anchor", 1.0)
-    anchor_spectrum = extra_options.pop("anchor_spectrum", torch.tensor([1.0], dtype=torch.float32))
-    tukey_alpha = extra_options.pop("tukey_alpha", 0.25)
-    high_freq_noise = extra_options.pop("high_freq_noise", None)
+    scale_ratio = extra_options.pop("scale_ratio")
+    scale_steps = extra_options.pop("scale_steps")
+    denoised_upscale = extra_options.pop("denoised_upscale")
+    noise_anchor = extra_options.pop("noise_anchor")
+    anchor_spectrum = extra_options.pop("anchor_spectrum")
+    tukey_alpha = extra_options.pop("tukey_alpha")
+    high_freq_noise = extra_options.pop("high_freq_noise")
 
     extra_args = {} if extra_args is None else extra_args
+    model_patcher = model_k.inner_model.model_patcher
+    flow_mode = isinstance(model_patcher.get_model_object("model_sampling"), comfy.model_sampling.CONST)
+    patch_unpack_2x2 = isinstance(model_patcher.get_model_object("latent_format"), (comfy.latent_formats.Flux2, comfy.latent_formats.Wan22))
+    partial_anchor = noise_anchor < 1.0 or bool((anchor_spectrum < 1.0).any())
+    generator = torch.Generator().manual_seed(extra_args.get("seed", 0))
+
     x = noise
+    nested = isinstance(x, NestedTensor)
+    h_orig, w_orig = (x.unbind()[0] if nested else x).shape[-2:]
     s_in = x.new_ones([x.shape[0]])
 
-    if scale_steps < 0:
-        scale_steps = len(sigmas) - 1
+    n_active = int((sigmas[1:] > 0).sum())
+    n_scale = n_active if scale_steps < 0 else min(scale_steps, n_active)
 
-    flow_mode = _is_flow_matching(model_k, sigmas)
+    def fresh_noise(shape, ref, step):
+        if high_freq_noise is None:
+            return torch.randn(shape, generator=generator).to(device=ref.device, dtype=ref.dtype)
+        step_noise = copy.copy(high_freq_noise)
+        step_noise.seed = high_freq_noise.seed + step
+        return step_noise.generate_noise({"samples": torch.empty(shape)}).to(device=ref.device, dtype=ref.dtype)
+
+    def step_tensor(x_t, denoised_t, sigma, sigma_next, size, step):
+        if flow_mode:
+            eps_t = (x_t - (1.0 - sigma) * denoised_t) / sigma
+        else:
+            eps_t = (x_t - denoised_t) / sigma
+
+        resize = size is not None and size != tuple(denoised_t.shape[-2:])
+        if resize or (size is not None and partial_anchor):
+            d4d, meta = _to_4d(denoised_t)
+            e4d, _ = _to_4d(eps_t)
+            if resize:
+                d4d = _upscale_denoised_4d(d4d, *size, denoised_upscale, patch_unpack_2x2, tukey_alpha)
+            fresh4d, _ = _to_4d(fresh_noise((*denoised_t.shape[:-2], *size), denoised_t, step))
+            e4d = _fourier_mix_noise_4d(e4d, fresh4d, anchor_spectrum, noise_anchor)
+            denoised_t, eps_t = _from_4d(d4d, meta), _from_4d(e4d, meta)
+
+        if flow_mode:
+            return (1.0 - sigma_next) * denoised_t + sigma_next * eps_t
+        return denoised_t + sigma_next * eps_t
 
     for i in trange(len(sigmas) - 1, disable=disable):
-        sigma_cur = sigmas[i]
+        sigma = sigmas[i]
         sigma_next = sigmas[i + 1]
 
-        denoised = model_k(x, sigma_cur * s_in, **extra_args)
+        denoised = model_k(x, sigma * s_in, **extra_args)
         if callback is not None:
-            callback({"x": x, "i": i, "sigma": sigma_cur, "sigma_hat": sigma_cur, "denoised": denoised})
+            callback({"x": x, "i": i, "sigma": sigma, "sigma_hat": sigma, "denoised": denoised})
 
         if sigma_next == 0:
             x = denoised
             continue
 
-        if float(sigma_cur) > 1e-6:
-            eps_exact = (x - (1.0 - sigma_cur) * denoised) / sigma_cur if flow_mode else (x - denoised) / sigma_cur
+        x_main = x.unbind()[0] if nested else x
+        if i < n_scale:
+            factor = 1.0 + (scale_ratio - 1.0) * (i + 1) / n_scale
+            size = (max(2, int(round(h_orig * factor)) // 2 * 2), max(2, int(round(w_orig * factor)) // 2 * 2))
         else:
-            eps_exact = torch.randn_like(x)
+            size = tuple(x_main.shape[-2:])
 
-        do_scale = (i < scale_steps) and (abs(scale_ratio - 1.0) > 1e-4)
-        target_scale = (
-            1.0 + (scale_ratio - 1.0) * ((i + 1) / max(1, scale_steps))
-            if (do_scale and scale_steps > 1)
-            else (scale_ratio if do_scale else 1.0)
-        )
-
-        # NestedTensor-safe (parité avec MaskedNoise / LatentNoise)
-        if getattr(x, "is_nested", False):
-            d_list, e_list = [], []
-            for di, ei in zip(denoised.unbind(), eps_exact.unbind()):
-                # unbind sur batch -> ajoute dim batch temporaire si 3D/4D
-                di_b = di.unsqueeze(0)
-                ei_b = ei.unsqueeze(0)
-                du, eu = _upscale_step_tensors(
-                    di_b, ei_b, target_scale, denoised_upscale, patch_unpack_2x2,
-                    tukey_alpha, anchor_spectrum, noise_anchor, high_freq_noise
-                )
-                d_list.append(du.squeeze(0))
-                e_list.append(eu.squeeze(0))
-            denoised = torch.nested.nested_tensor(d_list, dtype=x.dtype, device=x.device)
-            eps_mix = torch.nested.nested_tensor(e_list, dtype=x.dtype, device=x.device)
+        if nested:
+            # Only the first (video) latent is upscaled, the others (e.g. LTXAV audio) are stepped as is
+            xs, ds = x.unbind(), denoised.unbind()
+            x = NestedTensor([step_tensor(xs[0], ds[0], sigma, sigma_next, size, i)] +
+                             [step_tensor(xt, dt, sigma, sigma_next, None, i) for xt, dt in zip(xs[1:], ds[1:])])
         else:
-            denoised, eps_mix = _upscale_step_tensors(
-                denoised, eps_exact, target_scale, denoised_upscale, patch_unpack_2x2,
-                tukey_alpha, anchor_spectrum, noise_anchor, high_freq_noise
-            )
-
-        x = ((1.0 - sigma_next) * denoised + sigma_next * eps_mix) if flow_mode else (denoised + sigma_next * eps_mix)
+            x = step_tensor(x, denoised, sigma, sigma_next, size, i)
 
     return x
