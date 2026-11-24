@@ -117,24 +117,29 @@ def _fourier_mix_noise_4d(eps4d, fresh4d, anchor_spectrum, noise_anchor):
     _, _, h, w = eps4d.shape
     _, _, h2, w2 = fresh4d.shape
 
+    h0 = h2 // 2 - h // 2
+    w0 = w2 // 2 - w // 2
+    split_h = h % 2 == 0 and h0 + h < h2
+    split_w = w % 2 == 0 and w0 + w < w2
+
+    # The Nyquist bins of the original band are split between both ends of the larger spectrum,
+    # each end taking half of the eps energy and filling the rest with its own fresh noise (Hermitian, unit variance)
     mask = torch.clamp(create_radial_filter(anchor_spectrum, h, w, eps4d.device) * noise_anchor, 0.0, 1.0)
+    if split_h:
+        mask[0, :] *= 0.5
+    if split_w:
+        mask[:, 0] *= 0.5
 
     fft_e = torch.fft.fftshift(torch.fft.fft2(eps4d.to(torch.float32), dim=(-2, -1), norm="ortho"), dim=(-2, -1))
     fft_f = torch.fft.fftshift(torch.fft.fft2(fresh4d.to(torch.float32), dim=(-2, -1), norm="ortho"), dim=(-2, -1))
 
-    h0 = h2 // 2 - h // 2
-    w0 = w2 // 2 - w // 2
-    fresh_band = fft_f[..., h0:h0 + h, w0:w0 + w].clone()
-    fft_f[..., h0:h0 + h, w0:w0 + w] = torch.sqrt(mask) * fft_e + torch.sqrt(1.0 - mask) * fresh_band
-
-    # Nyquist bins of the original band: split between both ends, keeping unit variance
-    half = math.sqrt(0.5)
-    if h % 2 == 0 and h0 + h < h2:
-        fft_f[..., h0, w0:w0 + w] = half * fft_f[..., h0, w0:w0 + w] + half * fresh_band[..., 0, :]
-        fft_f[..., h0 + h, w0:w0 + w] = fft_f[..., h0, w0:w0 + w]
-    if w % 2 == 0 and w0 + w < w2:
-        fft_f[..., h0:h0 + h, w0] = half * fft_f[..., h0:h0 + h, w0] + half * fresh_band[..., :, 0]
-        fft_f[..., h0:h0 + h, w0 + w] = fft_f[..., h0:h0 + h, w0]
+    fft_f[..., h0:h0 + h, w0:w0 + w] = torch.sqrt(mask) * fft_e + torch.sqrt(1.0 - mask) * fft_f[..., h0:h0 + h, w0:w0 + w]
+    if split_h:
+        fft_f[..., h0 + h, w0:w0 + w] = torch.sqrt(mask[0]) * fft_e[..., 0, :] + torch.sqrt(1.0 - mask[0]) * fft_f[..., h0 + h, w0:w0 + w]
+    if split_w:
+        fft_f[..., h0:h0 + h, w0 + w] = torch.sqrt(mask[:, 0]) * fft_e[..., :, 0] + torch.sqrt(1.0 - mask[:, 0]) * fft_f[..., h0:h0 + h, w0 + w]
+    if split_h and split_w:
+        fft_f[..., h0 + h, w0 + w] = torch.sqrt(mask[0, 0]) * fft_e[..., 0, 0] + torch.sqrt(1.0 - mask[0, 0]) * fft_f[..., h0 + h, w0 + w]
 
     out = torch.fft.ifft2(torch.fft.ifftshift(fft_f, dim=(-2, -1)), dim=(-2, -1), norm="ortho").real
     return out.to(eps4d.dtype)
