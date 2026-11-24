@@ -94,20 +94,12 @@ def _fourier_upscale_signal(x4d: torch.Tensor, h2: int, w2: int, tukey_alpha: fl
     return out.to(orig_dtype)
 
 
-def _upscale_denoised_4d(d4d: torch.Tensor, h2: int, w2: int, method: str, patch_unpack_2x2: bool, tukey_alpha: float) -> torch.Tensor:
-    use_unpack = patch_unpack_2x2 and (d4d.shape[1] % 4 == 0)
-    work = F.pixel_shuffle(d4d, 2) if use_unpack else d4d
-    th = h2 * 2 if use_unpack else h2
-    tw = w2 * 2 if use_unpack else w2
-
+def _upscale_denoised_4d(d4d: torch.Tensor, h2: int, w2: int, method: str, tukey_alpha: float) -> torch.Tensor:
     if method == "fourier_tukey":
-        up = _fourier_upscale_signal(work, th, tw, tukey_alpha)
-    elif method == "bislerp":
-        up = comfy.utils.bislerp(work, tw, th)
-    else:
-        up = comfy.utils.common_upscale(work, tw, th, method, "disabled")
-
-    return F.pixel_unshuffle(up, 2) if use_unpack else up
+        return _fourier_upscale_signal(d4d, h2, w2, tukey_alpha)
+    if method == "bislerp":
+        return comfy.utils.bislerp(d4d, w2, h2)
+    return comfy.utils.common_upscale(d4d, w2, h2, method, "disabled")
 
 
 def _fourier_mix_noise_4d(eps4d, fresh4d, anchor_spectrum, noise_anchor):
@@ -186,10 +178,15 @@ def fourier_upscale_sampler_function(model_k, noise, sigmas, extra_args=None, ca
         if resize or (size is not None and partial_anchor):
             d4d, meta = _to_4d(denoised_t)
             e4d, _ = _to_4d(eps_t)
-            if resize:
-                d4d = _upscale_denoised_4d(d4d, *size, denoised_upscale, patch_unpack_2x2, tukey_alpha)
             fresh4d, _ = _to_4d(fresh_noise((*denoised_t.shape[:-2], *size), denoised_t, step))
+            # Upscale and mix on the real spatial grid of 2x2 channel-patched latents
+            if patch_unpack_2x2:
+                d4d, e4d, fresh4d = F.pixel_shuffle(d4d, 2), F.pixel_shuffle(e4d, 2), F.pixel_shuffle(fresh4d, 2)
+            if resize:
+                d4d = _upscale_denoised_4d(d4d, *fresh4d.shape[-2:], denoised_upscale, tukey_alpha)
             e4d = _fourier_mix_noise_4d(e4d, fresh4d, anchor_spectrum, noise_anchor)
+            if patch_unpack_2x2:
+                d4d, e4d = F.pixel_unshuffle(d4d, 2), F.pixel_unshuffle(e4d, 2)
             denoised_t, eps_t = _from_4d(d4d, meta), _from_4d(e4d, meta)
 
         if flow_mode:
