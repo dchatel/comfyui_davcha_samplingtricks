@@ -154,7 +154,7 @@ def fourier_upscale_sampler_function(model_k, noise, sigmas, extra_args=None, ca
     flow_mode = isinstance(model_patcher.get_model_object("model_sampling"), comfy.model_sampling.CONST)
     patch_unpack_2x2 = isinstance(model_patcher.get_model_object("latent_format"), (comfy.latent_formats.Flux2, comfy.latent_formats.Wan22))
     partial_anchor = noise_anchor < 1.0 or bool((anchor_spectrum < 1.0).any())
-    generator = torch.Generator().manual_seed(extra_args.get("seed", 0))
+    generator = torch.Generator().manual_seed(extra_args.get("seed", 0) + 1)
 
     x = noise
     nested = isinstance(x, NestedTensor)

@@ -216,6 +216,8 @@ class DavchaSamplerFourierUpscale(io.ComfyNode):
             anchor_spectrum = 1.0
         if isinstance(anchor_spectrum, float):
             anchor_spectrum = torch.tensor([anchor_spectrum], dtype=torch.float32)
+        elif isinstance(anchor_spectrum, list):
+            anchor_spectrum = torch.tensor(anchor_spectrum, dtype=torch.float32)
 
         return io.NodeOutput(KSAMPLER(fourier_upscale_sampler_function, extra_options={
             "scale_ratio": scale_ratio,
